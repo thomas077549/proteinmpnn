@@ -5,6 +5,8 @@ import torch
 import json
 import copy
 import pickle
+from contextlib import nullcontext
+from decoding_order import decoding_record, decoding_fasta_record
 from protein_mpnn.protein_mpnn_utils import ProteinMPNN, tied_featurize, _scores, _S_to_seq
 from mpnn_utils import determine_weight_directory, MODEL_CONFIG, MODEL_NAMES, get_pdb_dataset, transform_inputs
 from generate_json import FileArgumentParser
@@ -21,7 +23,9 @@ def decide_model_weights():
 
 
 def run_protein_mpnn(args):
-
+    save_order = getattr(args, 'save_decoding_order', False)
+    if save_order and (args.mcmc or args.pairwise):
+        raise ValueError('Decoding-order export supports ordinary and tied sampling, not MCMC or pairwise sampling.')
     # Extract hyperparameters from model config
     hidden_dim = MODEL_CONFIG['hidden_dim']
     num_layers = MODEL_CONFIG['num_layers']
@@ -101,7 +105,7 @@ def run_protein_mpnn(args):
             probs_list = []
             batch_clones = [copy.deepcopy(protein) for i in range(BATCH_COPIES)]
             chain_id_dict, fixed_positions_dict, pssm_dict, omit_AA_dict, bias_AA_dict_decoy, tied_positions_dict, bias_by_res_decoy = transform_inputs(design_specs_dict, protein, experimental=args.experimental)
-            X, S, mask, _, chain_M, chain_encoding_all, _, visible_list_list, masked_list_list, masked_chain_length_list_list, chain_M_pos, omit_AA_mask, residue_idx, _, tied_pos_list_of_lists_list, pssm_coef, pssm_bias, pssm_log_odds_all, bias_by_res_all, tied_beta = tied_featurize(batch_clones, device, chain_id_dict, fixed_positions_dict, omit_AA_dict, tied_positions_dict, pssm_dict, bias_by_res_dict)
+            X, S, mask, _, chain_M, chain_encoding_all, chain_letters_list, visible_list_list, masked_list_list, masked_chain_length_list_list, chain_M_pos, omit_AA_mask, residue_idx, _, tied_pos_list_of_lists_list, pssm_coef, pssm_bias, pssm_log_odds_all, bias_by_res_all, tied_beta = tied_featurize(batch_clones, device, chain_id_dict, fixed_positions_dict, omit_AA_dict, tied_positions_dict, pssm_dict, bias_by_res_dict)
             # Setting pssm threshold to 0 for now. TODO: CHANGE LATER
             pssm_threshold = 0.0
             pssm_log_odds_mask = (pssm_log_odds_all > pssm_threshold).float()
@@ -115,9 +119,12 @@ def run_protein_mpnn(args):
             native_score, native_scores_per_res = scores.cpu().data.numpy(), scores_per_res
             native_mask_for_loss = mask_for_loss
             # Generate some sequences
-            ali_file = os.path.join(output_folder,  batch_clones[0]['name'] + '.fasta')
-            af2_file = os.path.join(output_folder, batch_clones[0]['name'] + '.csv')
-            prob_file = os.path.join(output_folder, batch_clones[0]['name'] + '.npz')
+            # The upstream parser can retain an absolute name on Windows.
+            # Keep all artifacts inside the requested output directory on both OSes.
+            output_stem = os.path.basename(name_)
+            ali_file = os.path.join(output_folder, output_stem + '.fasta')
+            af2_file = os.path.join(output_folder, output_stem + '.csv')
+            prob_file = os.path.join(output_folder, output_stem + '.npz')
 
             # multi-state splitting files
             if 'chain_key' in design_specs_dict:
@@ -128,7 +135,12 @@ def run_protein_mpnn(args):
             if args.bidirectional:
                 print(f'Bidirectional coding requested for: {name_}')
             t0 = time.time()
-            with open(ali_file, 'w') as f:
+            order_file = os.path.join(output_folder, output_stem + '.decoding_order.jsonl')
+            order_fasta = os.path.join(output_folder, output_stem + '.decoding_order.fasta')
+            record_index = 0
+            with open(ali_file, 'w') as f, \
+                    (open(order_file, 'w') if save_order else nullcontext()) as order_out, \
+                    (open(order_fasta, 'w') if save_order else nullcontext()) as order_fasta_out:
                 for temp in temperatures:
                     for j in range(NUM_BATCHES):
                         randn_2 = torch.randn(chain_M.shape, device=X.device)
@@ -253,7 +265,19 @@ def run_protein_mpnn(args):
                                 l0 += 1
                             score_print = np.format_float_positional(np.float32(score), unique=False, precision=4)
                             seq_rec_print = np.format_float_positional(np.float32(seq_recovery_rate.detach().cpu().numpy()), unique=False, precision=4)
-                            f.write('>T={}, sample={}, score={}, seq_recovery={}\n{}\n'.format(temp,b_ix,score_print,seq_rec_print,seq)) #write generated sequence
+                            header = 'T={}, sample={}, score={}, seq_recovery={}'.format(temp,b_ix,score_print,seq_rec_print)
+                            f.write('>{}\n{}\n'.format(header, seq))
+                            record_index += 1  # native is FASTA record 0; generated records start at 1
+                            if order_out is not None:
+                                record = decoding_record(
+                                    protein, chain_letters_list[b_ix],
+                                    sample_dict['decoding_order'][b_ix].detach().cpu().tolist(),
+                                    mask[b_ix].detach().cpu().tolist(),
+                                    (chain_M[b_ix] * chain_M_pos[b_ix]).detach().cpu().tolist(),
+                                    record_index, header, seq, temp, args.backbone_noise, args.model_name,
+                                )
+                                order_out.write(json.dumps(record) + '\n')
+                                order_fasta_out.write(decoding_fasta_record(record, masked_list))
 
                             # FOR DESIGNED SEQUENCES
                             if 'chain_key' in design_specs_dict:
@@ -499,5 +523,6 @@ if __name__ == "__main__":
     parser.add_argument('--pairwise', action='store_true', help='Enables parsing for experimental pairwise mutation clusters (experimental).')
     parser.add_argument('--mcmc', action='store_true', help='If enabled, bidirectional coding uses MCMC routine. Must have --bidirectional flag enabled.')
     parser.add_argument('--dump_probs', action='store_true', help='If enabled, predicted sequence probability tables (L x 20) will be dumped for each scaffold. If >1 sequence per scaffold is generated, probs are averaged before saving.')
+    parser.add_argument('--save_decoding_order', action='store_true', help='Save JSONL metadata and a matching-header FASTA of one-based residue positions in decoding order beside the primary FASTA.')
     args = parser.parse_args()
     run_protein_mpnn(args) 
